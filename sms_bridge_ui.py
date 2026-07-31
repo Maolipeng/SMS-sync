@@ -178,6 +178,9 @@ def render_page(csrf_token: str) -> str:
     .btn[disabled] {{ cursor: wait; opacity: .55; transform: none; box-shadow: none; }}
     .actions {{ display: flex; flex-wrap: wrap; gap: 9px; margin-top: 18px; }}
     .inline-note {{ min-height: 20px; margin: 10px 0 0; color: var(--green); font-size: 12px; }}
+    .provider-meta {{ display: flex; flex-wrap: wrap; align-items: center; gap: 9px; margin-bottom: 16px; }}
+    .provider-badge {{ display: inline-flex; align-items: center; min-height: 25px; padding: 0 9px; border: 1px solid var(--line); border-radius: 999px; color: var(--muted); background: rgba(255,255,255,.55); font-size: 10px; font-weight: 800; letter-spacing: .06em; text-transform: uppercase; }}
+    .provider-badge[data-state="ready"] {{ color: var(--green); border-color: rgba(23,107,75,.22); background: var(--green-soft); }}
 
     .pair-link {{ display: none; margin-top: 18px; padding: 16px 17px; border: 1px solid rgba(23,107,75,.20); border-radius: 14px; background: var(--green-soft); }}
     .pair-link[data-visible="true"] {{ display: block; }}
@@ -295,11 +298,11 @@ def render_page(csrf_token: str) -> str:
       <div>
         <div class="eyebrow">Private by architecture</div>
         <h1>验证码，只去<br>你授权的地方。</h1>
-        <p class="hero-copy">将 iPhone 同步到 Mac 的验证码转发至一个已配对的 Telegram 私聊。所有配置留在本机，没有公网入口，也不建立验证码历史。</p>
+        <p class="hero-copy">将 iPhone 同步到 Mac 的验证码转发至你启用的 Telegram 私聊或 Discord 私密频道。所有配置留在本机，没有公网入口，也不建立验证码历史。</p>
       </div>
       <aside class="privacy-note">
         <strong>数据路径一眼可见</strong>
-        <p>Messages 数据库 → 本机内存 → Telegram Bot API。原文只有在你明确开启时才会发送。</p>
+        <p>Messages 数据库 → 本机内存 → 已启用的通知渠道。原文只有在你明确开启时才会发送。</p>
       </aside>
     </section>
 
@@ -345,6 +348,42 @@ def render_page(csrf_token: str) -> str:
             <div class="step-head">
               <span class="step-number">03</span>
               <div>
+                <h2 class="step-title">添加 Discord Webhook</h2>
+                <p class="step-copy">可选。将通知发送到你自己的 Discord 私密频道，无需运行 Discord Bot。</p>
+              </div>
+            </div>
+            <div class="provider-meta">
+              <span id="discordBadge" class="provider-badge">尚未配置</span>
+              <span class="step-copy">URL 仅存入 macOS 钥匙串，页面不会再次显示。</span>
+            </div>
+            <label class="field-label" for="discordWebhook">WEBHOOK URL</label>
+            <form id="discordForm" class="field-row">
+              <input id="discordWebhook" class="token-input" type="password" placeholder="https://discord.com/api/webhooks/…" autocomplete="off" spellcheck="false">
+              <button id="saveDiscord" class="btn" type="submit">验证并保存</button>
+            </form>
+            <div class="switch-row">
+              <div class="switch-copy">
+                <strong>启用 Discord 通知</strong>
+                <span>重新启用后只接收之后到达的新消息，不补发停用期间的内容。</span>
+              </div>
+              <label class="switch" aria-label="启用 Discord 通知">
+                <input id="discordEnabled" type="checkbox">
+                <span class="switch-track"></span>
+              </label>
+            </div>
+            <div class="actions">
+              <button id="discordTest" class="btn btn-secondary" type="button">测试 Discord</button>
+              <button id="discordRemove" class="btn btn-danger" type="button">移除 Webhook</button>
+            </div>
+            <p id="discordNote" class="inline-note" role="status"></p>
+          </div>
+        </article>
+
+        <article class="card">
+          <div class="card-body">
+            <div class="step-head">
+              <span class="step-number">04</span>
+              <div>
                 <h2 class="step-title">通知与运行</h2>
                 <p class="step-copy">通知默认包含验证码和完整发件人标识，便于立即判断来源。</p>
               </div>
@@ -360,11 +399,11 @@ def render_page(csrf_token: str) -> str:
                 <option value="all">所有收到的文本</option>
               </select>
             </div>
-            <p id="modeWarning" class="rule-warning" hidden>“所有收到的文本”会把普通短信和 iMessage 原文发送到 Telegram，请仅在你明确接受该隐私风险时使用。</p>
+            <p id="modeWarning" class="rule-warning" hidden>“所有收到的文本”会把普通短信和 iMessage 原文发送到所有已启用渠道，请仅在你明确接受该隐私风险时使用。</p>
             <div class="switch-row">
               <div class="switch-copy">
                 <strong>附带短信原文</strong>
-                <span>开启后，原文会发送至已配对私聊；SMS Bridge 仍不会额外保存历史。</span>
+                <span>开启后，原文会发送至所有已启用渠道；SMS Bridge 仍不会额外保存历史。</span>
               </div>
               <label class="switch" aria-label="附带短信原文">
                 <input id="showOriginal" type="checkbox">
@@ -389,6 +428,7 @@ def render_page(csrf_token: str) -> str:
             <div id="checkMessages" class="check"><i class="check-dot"></i><div><strong>Messages 数据库</strong><span>检查中</span></div></div>
             <div id="checkToken" class="check"><i class="check-dot"></i><div><strong>macOS 钥匙串</strong><span>检查中</span></div></div>
             <div id="checkPair" class="check"><i class="check-dot"></i><div><strong>Telegram 私聊</strong><span>检查中</span></div></div>
+            <div id="checkDiscord" class="check"><i class="check-dot"></i><div><strong>Discord Webhook</strong><span>检查中</span></div></div>
             <div id="checkService" class="check"><i class="check-dot"></i><div><strong>转发服务</strong><span>本机监听</span></div></div>
           </div>
         </section>
@@ -396,8 +436,8 @@ def render_page(csrf_token: str) -> str:
           <h2 class="side-title">安全边界</h2>
           <ul class="principles">
             <li>只监听 127.0.0.1</li>
-            <li>只允许一个私聊接收</li>
-            <li>Token 静态仅存钥匙串</li>
+            <li>只向你启用的渠道发送</li>
+            <li>Token 与 Webhook 仅存钥匙串</li>
             <li>默认不发送短信原文</li>
           </ul>
         </section>
@@ -420,6 +460,7 @@ def render_page(csrf_token: str) -> str:
       messages: "Messages 数据库",
       keychain: "macOS 钥匙串",
       telegram: "Telegram Bot",
+      discord: "Discord Webhook",
       launchAgent: "后台常驻"
     }};
     let toastTimer;
@@ -456,13 +497,20 @@ def render_page(csrf_token: str) -> str:
     async function refresh() {{
       try {{
         const state = await api("status");
-        const ready = state.configured && state.messagesReadable && state.paired;
+        const ready = state.hasActiveProvider && state.messagesReadable;
         $("statusPill").dataset.state = ready ? "ready" : "checking";
         $("statusPill").querySelector("span").textContent = ready ? "已就绪" : "等待设置";
         setCheck("checkMessages", state.messagesReadable, state.messagesReadable ? "已获读取权限" : "待验证：授权专用 Python 后安装后台常驻");
         setCheck("checkToken", state.configured, state.configured ? "Token 已安全保存" : "尚未保存 Token");
         setCheck("checkPair", state.paired, state.paired ? "已配对 · " + state.pairedName : "尚未授权私聊");
+        setCheck("checkDiscord", state.discordEnabled, state.discordEnabled ? "Webhook 已启用" : state.discordConfigured ? "已保存 · 当前停用" : "未配置（可选）");
         setCheck("checkService", !state.lastError, state.lastError ? "最近异常：" + state.lastError : "正在本机监听");
+        $("discordBadge").dataset.state = state.discordEnabled ? "ready" : "idle";
+        $("discordBadge").textContent = state.discordEnabled ? "已启用" : state.discordConfigured ? "已保存 · 已停用" : "尚未配置";
+        $("discordEnabled").checked = Boolean(state.discordEnabled);
+        $("discordEnabled").disabled = !state.discordConfigured;
+        $("discordTest").disabled = !state.discordConfigured;
+        $("discordRemove").disabled = !state.discordConfigured;
         $("forwardMode").value = state.forwardMode || "strict";
         const allMessages = state.forwardMode === "all";
         $("modeWarning").hidden = !allMessages;
@@ -486,7 +534,10 @@ def render_page(csrf_token: str) -> str:
     async function withBusy(button, work) {{
       button.disabled = true;
       try {{ await work(); }} catch (error) {{ toast(error.message, "error"); }}
-      finally {{ button.disabled = false; }}
+      finally {{
+        button.disabled = false;
+        if (button.id === "discordTest" || button.id === "discordRemove") await refresh();
+      }}
     }}
 
     $("tokenForm").addEventListener("submit", (event) => {{
@@ -494,13 +545,51 @@ def render_page(csrf_token: str) -> str:
       withBusy($("saveToken"), async () => {{
       const token = $("token").value.trim();
       if (!token) throw new Error("请先粘贴 Bot Token");
-      await api("token", {{token}});
       $("token").value = "";
+      await api("token", {{token}});
       $("tokenNote").textContent = "已保存。为安全起见，旧配对已清除。";
       toast("Bot Token 已存入 macOS 钥匙串");
       await refresh();
       }});
     }});
+
+    $("discordForm").addEventListener("submit", (event) => {{
+      event.preventDefault();
+      withBusy($("saveDiscord"), async () => {{
+        const webhookUrl = $("discordWebhook").value.trim();
+        if (!webhookUrl) throw new Error("请先粘贴 Discord Webhook URL");
+        $("discordWebhook").value = "";
+        await api("discord", {{webhookUrl}});
+        $("discordNote").textContent = "Webhook 已验证并启用，只会接收之后到达的新消息。";
+        toast("Discord Webhook 已存入 macOS 钥匙串");
+        await refresh();
+      }});
+    }});
+
+    $("discordEnabled").addEventListener("change", async (event) => {{
+      try {{
+        await api("settings", {{discordEnabled: event.target.checked}});
+        toast(event.target.checked ? "Discord 通知已启用" : "Discord 通知已停用");
+        await refresh();
+      }} catch (error) {{
+        event.target.checked = !event.target.checked;
+        toast(error.message, "error");
+      }}
+    }});
+
+    $("discordTest").addEventListener("click", () => withBusy($("discordTest"), async () => {{
+      await api("test", {{provider: "discord"}});
+      toast("Discord 测试通知已发送");
+      await refresh();
+    }}));
+
+    $("discordRemove").addEventListener("click", () => withBusy($("discordRemove"), async () => {{
+      if (!confirm("从 macOS 钥匙串删除 Discord Webhook URL？Telegram 配置不会受影响。")) return;
+      await api("discord/remove", {{}});
+      $("discordNote").textContent = "Discord Webhook 已移除。";
+      toast("Discord Webhook 已删除");
+      await refresh();
+    }}));
 
     $("pair").addEventListener("click", () => withBusy($("pair"), async () => {{
       const result = await api("pair", {{}});
@@ -523,7 +612,7 @@ def render_page(csrf_token: str) -> str:
     $("forwardMode").addEventListener("change", async (event) => {{
       const previous = (await api("status")).forwardMode || "strict";
       const selected = event.target.value;
-      if (selected === "all" && !confirm("“所有收到的文本”会把普通短信和 iMessage 原文发送到已配对 Telegram 私聊。确定启用吗？")) {{
+      if (selected === "all" && !confirm("“所有收到的文本”会把普通短信和 iMessage 原文发送到所有已启用渠道。确定启用吗？")) {{
         event.target.value = previous;
         return;
       }}
@@ -539,7 +628,7 @@ def render_page(csrf_token: str) -> str:
 
     $("testPush").addEventListener("click", () => withBusy($("testPush"), async () => {{
       await api("test", {{}});
-      toast("测试通知已发送");
+      toast("测试通知已发送到所有启用渠道");
     }}));
 
     $("doctor").addEventListener("click", () => withBusy($("doctor"), async () => {{
@@ -571,7 +660,7 @@ def render_page(csrf_token: str) -> str:
       await refresh();
     }}));
     $("reset").addEventListener("click", () => withBusy($("reset"), async () => {{
-      if (!confirm("这会永久删除钥匙串 Token、配对、运行状态、日志、专用运行时和后台常驻服务。Telegram Token 撤销及 macOS 完全磁盘访问权限需要你另行处理。确定继续吗？")) return;
+      if (!confirm("这会永久删除钥匙串中的渠道凭据、配对、运行状态、日志、专用运行时和后台常驻服务。Telegram Token 撤销、Discord 服务端 Webhook 删除及 macOS 权限需要你另行处理。确定继续吗？")) return;
       await api("reset", {{}});
       toast("本机配置已安全移除；本页即将关闭");
     }}));

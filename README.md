@@ -1,6 +1,6 @@
 # SMS Bridge
 
-把同步到 Mac 的 iPhone 验证码，安全地发送到你自己的 Telegram 私聊。
+把同步到 Mac 的 iPhone 验证码，安全地发送到你自己的 Telegram 私聊或 Discord 私密频道。
 
 SMS Bridge 是一个只在本机运行的开源工具：不需要 Docker、域名、服务器或编程知识，也不会开放公网端口。
 
@@ -8,7 +8,7 @@ SMS Bridge 是一个只在本机运行的开源工具：不需要 Docker、域�
 iPhone 收到验证码
       ↓  Apple「信息」同步
 Mac mini（SMS Bridge）
-      ↓  已配对的 Telegram 私聊
+      ↓  Telegram / Discord Provider
 你的另一台设备
 ```
 
@@ -18,9 +18,9 @@ Mac mini（SMS Bridge）
 
 - iPhone 与 Mac 使用同一个 Apple 账户，并在两端开启「信息」同步；
 - 先确认 Mac 的「信息」App 已能看到 iPhone 收到的短信；
-- 在 Telegram 通过 `@BotFather` 创建一个 Bot，并复制它给出的 **Bot Token**。
+- 至少准备一个通知渠道：Telegram Bot，或 Discord 私密频道的 Incoming Webhook。
 
-> Bot Token 类似密码。请不要发到群聊、截图或提交到 Git。若曾泄露，请在 `@BotFather` 使用 `/revoke` 生成新的 Token。Token 会保存到 macOS 钥匙串；`.env` 仅供开发测试，默认不会被读取。
+> Bot Token 和 Discord Webhook URL 都属于凭据。请不要发到群聊、截图或提交到 Git。若曾泄露，请立即撤销 Token 或重新生成 Webhook。凭据会保存到 macOS 钥匙串；`.env` 仅供开发测试，默认不会被读取。
 
 ### 2. 启动本机设置页
 
@@ -32,12 +32,12 @@ SMS Bridge.command
 
 也可以在 iTerm 或 Terminal 进入项目目录并执行 `python3 sms_bridge.py`。浏览器会自动打开 `http://127.0.0.1:8765`。页面会引导你：
 
-1. 保存 Bot Token（保存至 macOS 钥匙串，而不是项目文件）；
-2. 点击“生成配对链接”；
-3. 用自己的 Telegram 打开链接，再点击“启动”；
+1. Telegram：保存 Bot Token并完成一次性私聊配对；
+2. Discord：粘贴私密频道的 Webhook URL并验证；
+3. 两者可以只启用一个，也可以同时启用；
 4. 点击“发送测试通知”。
 
-测试成功后，点击“安装后台常驻”，设置页会关闭并由当前用户的 LaunchAgent 接管；启动配置中不包含 Bot Token。
+测试成功后，点击“安装后台常驻”，设置页会关闭并由当前用户的 LaunchAgent 接管；启动配置中不包含任何渠道凭据。
 
 ### 3. 如提示权限不足
 
@@ -48,13 +48,15 @@ macOS 可能仍不允许由未授权 Terminal 直接启动的设置页读取信�
 ## 默认隐私规则
 
 - 仅监听本机的 `127.0.0.1`，没有公网入口；
-- 未配对时绝不转发；只允许一个 Telegram 私聊；
+- 未授权通知渠道时绝不转发；Telegram 只允许一个私聊，Discord 只使用用户保存的频道 Webhook；
 - 配对链接 10 分钟有效且只能使用一次；
 - 新安装默认使用“严格验证码”规则；可切换为“智能验证码”或显式启用“所有收到的文本”；
 - 通知默认发送“服务名 + 验证码/取件码 + 完整发件人标识（号码或邮箱）”，不发送完整短信正文或附件；取件短信会优先提取取件码，而不是运单尾号；
-- “所有收到的文本”会把普通短信与 iMessage 原文发送到 Telegram，属于高隐私风险选项；
+- “所有收到的文本”会把普通短信与 iMessage 原文发送到所有已启用渠道，属于高隐私风险选项；
 - 可在设置页勾选“在通知中显示完整原文”，或用 CLI 显式开启；原文只从本机信息数据库即时读取，不额外保存为历史；
-- 验证码不保存为历史记录；Bot Token 静态存储于 macOS 钥匙串，运行期间只在进程内存缓存一次，避免反复授权弹窗；
+- 验证码不保存为历史记录；Bot Token 与 Discord Webhook URL 静态存储于 macOS 钥匙串，运行期间只在进程内存缓存；
+- Discord URL 仅接受官方 `https://discord.com/api/webhooks/...` 形式，发送时禁用 mentions，并拒绝携带凭据的重定向；
+- 多渠道投递分别记录脱敏游标；一个渠道临时失败时，不会重复发送已在另一渠道成功投递的同一条消息；
 - 运行状态仅保存在 `~/Library/Application Support/SMS Bridge`，目录和数据库只允许当前用户访问；
 - 同时启动多个 CLI、设置页或常驻服务时会被单实例锁拒绝，避免重复转发；
 - 设置页的写操作只接受同源请求，防止恶意网页在后台替换 Token 或配对聊天；
@@ -70,18 +72,24 @@ python3 sms_bridge.py init        # 隐藏输入并保存 Bot Token（纯 CLI �
 python3 sms_bridge.py run         # 仅运行转发服务
 python3 sms_bridge.py pair        # 输出一次性 Telegram 配对链接
 python3 sms_bridge.py status      # 输出 JSON 格式的脱敏状态
-python3 sms_bridge.py doctor      # 检查本机权限、钥匙串、Telegram 与自动启动
-python3 sms_bridge.py test        # 给已配对私聊发送测试通知
+python3 sms_bridge.py doctor      # 检查本机权限、钥匙串、通知渠道与自动启动
+python3 sms_bridge.py test        # 给所有已启用渠道发送测试通知
+python3 sms_bridge.py test --provider discord
 python3 sms_bridge.py unpair      # 解除当前 Telegram 配对
 python3 sms_bridge.py install     # 安装当前用户的 LaunchAgent
 python3 sms_bridge.py uninstall   # 移除 LaunchAgent
-python3 sms_bridge.py reset --yes # 删除 Token、配对、状态、日志、专用运行时和 LaunchAgent
+python3 sms_bridge.py reset --yes # 删除渠道凭据、配对、状态、日志、专用运行时和 LaunchAgent
 python3 sms_bridge.py config      # 查看通知显示配置
-python3 sms_bridge.py config --show-original on   # 在 Telegram 通知中附带原文
+python3 sms_bridge.py config --show-original on   # 在所有已启用渠道中附带原文
 python3 sms_bridge.py config --show-original off  # 恢复隐私默认值
 python3 sms_bridge.py config --mode strict        # 严格验证码（默认）
 python3 sms_bridge.py config --mode smart         # 智能识别短验证码短信
 python3 sms_bridge.py config --mode all           # 所有收到的文本（含原文）
+python3 sms_bridge.py discord set                  # 隐藏输入并保存 Discord Webhook
+python3 sms_bridge.py discord test
+python3 sms_bridge.py discord enable
+python3 sms_bridge.py discord disable
+python3 sms_bridge.py discord remove
 python3 sms_bridge.py --help      # 查看命令帮助
 ```
 
@@ -91,7 +99,7 @@ python3 sms_bridge.py --help      # 查看命令帮助
 
 **为什么没有收到通知？**
 
-先点击设置页中的“发送测试通知”。若测试成功，检查该短信是否包含验证码相关字样（例如 `code`、`verification`、`验证码`）和 4–8 位数字，或包含明确的取件码/收件码；也确认它已经出现在 Mac 的「信息」App。
+先点击设置页中的“发送测试通知”。若测试成功，检查该短信是否包含验证码相关字样（例如 `code`、`verification`、`验证码`）和 4–8 位数字，或包含明确的取件码/收件码；也确认它已经出现在 Mac 的「信息」App。多渠道状态可通过 `status` 或设置页分别检查。
 
 **关闭终端后会怎样？**
 
@@ -99,7 +107,7 @@ python3 sms_bridge.py --help      # 查看命令帮助
 
 **可以发到群组吗？**
 
-不可以。验证码敏感，第一版只支持单个 Telegram 私聊。
+Telegram 只允许单个已配对私聊；Discord 则由你创建 Webhook 时选择目标私密频道。建议始终使用只有自己或受信成员可见的目标。
 
 ## 开源与安全
 

@@ -5,12 +5,12 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "sms-bridge"
 version = "0.1.0"
-description = "Local macOS Messages OTP relay for one paired Telegram private chat"
+description = "Local-first macOS Messages relay for Telegram and Discord"
 readme = "README.en.md"
 requires-python = ">=3.10"
 license = "MIT"
 license-files = ["LICENSE"]
-keywords = ["macos", "iphone", "sms", "otp", "telegram", "local-first"]
+keywords = ["macos", "iphone", "sms", "otp", "telegram", "discord", "local-first"]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Environment :: MacOS X",

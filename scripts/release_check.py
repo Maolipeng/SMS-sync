@@ -28,6 +28,10 @@ FORBIDDEN_NAMES = {
 }
 SECRET_PATTERNS = {
     "Telegram Bot Token": re.compile(rb"\b\d{7,12}:AA[A-Za-z0-9_-]{20,}\b"),
+    "Discord Webhook URL": re.compile(
+        rb"https://(?:canary\.|ptb\.)?discord(?:app)?\.com/api/webhooks/"
+        rb"\d{6,24}/[A-Za-z0-9._-]{20,}"
+    ),
     "private key": re.compile(rb"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
 }
 

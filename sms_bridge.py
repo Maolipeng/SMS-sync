@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""SMS Bridge — private, local-only iPhone Messages → Telegram relay.
+"""SMS Bridge — private, local-only iPhone Messages notification relay.
 
 Run `python3 sms_bridge.py` and open the local setup page.  The program has no
 third-party Python dependencies and never starts a public network listener.
@@ -26,8 +26,10 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import webbrowser
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -44,6 +46,7 @@ UI_LOCK_FILE = DATA_DIR / "sms-bridge-ui.lock"
 # Versioned service name avoids inheriting prototype ACLs that trusted `/usr/bin/security`.
 KEYCHAIN_SERVICE = "dev.smsbridge.telegram-bot-token.v1"
 LEGACY_KEYCHAIN_SERVICES = ("dev.smsbridge.telegram-bot-token",)
+DISCORD_KEYCHAIN_SERVICE = "dev.smsbridge.discord-webhook-url.v1"
 LAUNCH_AGENT_LABEL = "dev.smsbridge.service"
 LEGACY_LAUNCH_AGENT_LABELS = ("com.local.sms-bridge",)
 POLL_SECONDS = 3
@@ -53,6 +56,8 @@ MAX_PREVIEW_LENGTH = 1800
 MAX_ATTRIBUTED_BODY_BYTES = 1024 * 1024
 MAX_REQUEST_BYTES = 8 * 1024
 MAX_TELEGRAM_RESPONSE_BYTES = 2 * 1024 * 1024
+MAX_DISCORD_RESPONSE_BYTES = 512 * 1024
+MAX_DISCORD_MESSAGE_LENGTH = 1900
 CSRF_TOKEN = secrets.token_urlsafe(32)
 APPLE_MESSAGES_EPOCH = datetime(2001, 1, 1, tzinfo=timezone.utc)
 ERR_SEC_SUCCESS = 0
@@ -79,6 +84,9 @@ TOKEN_LOAD_LOCK = threading.Lock()
 AUTHORIZATION_LOCK = threading.RLock()
 TOKEN_CACHE_UNSET = object()
 TOKEN_CACHE: str | None | object = TOKEN_CACHE_UNSET
+DISCORD_CACHE_LOCK = threading.Lock()
+DISCORD_LOAD_LOCK = threading.Lock()
+DISCORD_WEBHOOK_CACHE: str | None | object = TOKEN_CACHE_UNSET
 
 
 class BridgeError(RuntimeError):
@@ -87,6 +95,10 @@ class BridgeError(RuntimeError):
 
 class TransientTelegramError(BridgeError):
     """A retryable Telegram transport failure."""
+
+
+class TransientProviderError(BridgeError):
+    """A retryable notification-provider transport failure."""
 
 
 class MessagesAccessError(BridgeError):
@@ -194,11 +206,11 @@ def keychain_frameworks() -> tuple[ctypes.CDLL, ctypes.CDLL]:
     return security, core_foundation
 
 
-def read_keychain_token_uncached() -> str | None:
-    """Perform one native Keychain lookup."""
+def read_keychain_secret_uncached(service_name: str, description: str) -> str | None:
+    """Perform one native Keychain lookup without exposing the stored value."""
     security, core_foundation = keychain_frameworks()
     void_p = ctypes.c_void_p
-    service = KEYCHAIN_SERVICE.encode("utf-8")
+    service = service_name.encode("utf-8")
     account = getpass.getuser().encode("utf-8")
     service_buffer = ctypes.create_string_buffer(service)
     account_buffer = ctypes.create_string_buffer(account)
@@ -217,23 +229,27 @@ def read_keychain_token_uncached() -> str | None:
     )
     if status == ERR_SEC_SUCCESS:
         try:
-            token = ctypes.string_at(password_data, password_length.value).decode("utf-8")
+            value = ctypes.string_at(password_data, password_length.value).decode("utf-8")
         except UnicodeDecodeError as exc:
-            raise BridgeError("钥匙串中的 Bot Token 不是有效文本，请重新保存。") from exc
+            raise BridgeError(f"钥匙串中的{description}不是有效文本，请重新保存。") from exc
         finally:
             if password_data:
                 security.SecKeychainItemFreeContent(None, password_data)
             if item:
                 core_foundation.CFRelease(item)
-        return token
+        return value
     if item:
         core_foundation.CFRelease(item)
     if status != ERR_SEC_ITEM_NOT_FOUND:
         raise BridgeError(f"无法读取 macOS 钥匙串（错误 {status}）。请确认登录钥匙串已解锁。")
-    if os.getenv("SMS_BRIDGE_ALLOW_ENV_TOKEN") == "1":
-        token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip() or None
-    else:
-        token = None
+    return None
+
+
+def read_keychain_token_uncached() -> str | None:
+    """Perform one native Telegram credential lookup."""
+    token = read_keychain_secret_uncached(KEYCHAIN_SERVICE, " Bot Token")
+    if token is None and os.getenv("SMS_BRIDGE_ALLOW_ENV_TOKEN") == "1":
+        return os.getenv("TELEGRAM_BOT_TOKEN", "").strip() or None
     return token
 
 
@@ -254,17 +270,16 @@ def keychain_token() -> str | None:
         return token
 
 
-def save_keychain_token(token: str) -> None:
-    """Write directly through Security.framework so the token never enters argv."""
-    if not token or len(token) > 512 or any(ord(char) < 32 for char in token):
-        raise BridgeError("Bot Token 格式无效。")
-
+def save_keychain_secret(service_name: str, value: str, description: str) -> None:
+    """Write a secret through Security.framework so it never enters argv."""
+    if not value or len(value) > 2048 or any(ord(char) < 32 for char in value):
+        raise BridgeError(f"{description}格式无效。")
     security, core_foundation = keychain_frameworks()
     uint32 = ctypes.c_uint32
     void_p = ctypes.c_void_p
-    service = KEYCHAIN_SERVICE.encode("utf-8")
+    service = service_name.encode("utf-8")
     account = getpass.getuser().encode("utf-8")
-    secret = token.encode("utf-8")
+    secret = value.encode("utf-8")
     service_buffer = ctypes.create_string_buffer(service)
     account_buffer = ctypes.create_string_buffer(account)
     secret_buffer = ctypes.create_string_buffer(secret)
@@ -300,6 +315,13 @@ def save_keychain_token(token: str) -> None:
         )
     if status not in (ERR_SEC_SUCCESS, ERR_SEC_DUPLICATE_ITEM):
         raise BridgeError(f"无法保存到 macOS 钥匙串（错误 {status}）。请确认登录钥匙串已解锁。")
+
+
+def save_keychain_token(token: str) -> None:
+    """Store the Telegram token and refresh its process-local cache."""
+    if len(token) > 512:
+        raise BridgeError("Bot Token 格式无效。")
+    save_keychain_secret(KEYCHAIN_SERVICE, token, "Bot Token")
     global TOKEN_CACHE
     with TOKEN_CACHE_LOCK:
         TOKEN_CACHE = token
@@ -336,7 +358,7 @@ def delete_keychain_service(service_name: str) -> None:
         if item:
             core_foundation.CFRelease(item)
     if status != ERR_SEC_SUCCESS:
-        raise BridgeError(f"无法删除钥匙串中的 Bot Token（错误 {status}）。")
+        raise BridgeError(f"无法删除钥匙串凭据（错误 {status}）。")
 
 
 def delete_keychain_token() -> None:
@@ -347,6 +369,38 @@ def delete_keychain_token() -> None:
     global TOKEN_CACHE
     with TOKEN_CACHE_LOCK:
         TOKEN_CACHE = None
+
+
+def discord_webhook_url() -> str | None:
+    """Read the optional Discord Webhook URL once per process."""
+    global DISCORD_WEBHOOK_CACHE
+    with DISCORD_CACHE_LOCK:
+        if DISCORD_WEBHOOK_CACHE is not TOKEN_CACHE_UNSET:
+            return DISCORD_WEBHOOK_CACHE if isinstance(DISCORD_WEBHOOK_CACHE, str) else None
+    with DISCORD_LOAD_LOCK:
+        with DISCORD_CACHE_LOCK:
+            if DISCORD_WEBHOOK_CACHE is not TOKEN_CACHE_UNSET:
+                return DISCORD_WEBHOOK_CACHE if isinstance(DISCORD_WEBHOOK_CACHE, str) else None
+        value = read_keychain_secret_uncached(DISCORD_KEYCHAIN_SERVICE, " Discord Webhook URL")
+        with DISCORD_CACHE_LOCK:
+            DISCORD_WEBHOOK_CACHE = value
+        return value
+
+
+def save_discord_webhook_url(value: str) -> None:
+    save_keychain_secret(DISCORD_KEYCHAIN_SERVICE, value, "Discord Webhook URL")
+    global DISCORD_WEBHOOK_CACHE
+    with DISCORD_CACHE_LOCK:
+        DISCORD_WEBHOOK_CACHE = value
+
+
+def delete_discord_webhook_url() -> None:
+    delete_keychain_service(DISCORD_KEYCHAIN_SERVICE)
+    global DISCORD_WEBHOOK_CACHE
+    with DISCORD_CACHE_LOCK:
+        DISCORD_WEBHOOK_CACHE = None
+    STATE.delete("discord_enabled")
+    STATE.delete("provider_cursor_discord")
 
 
 def configure_bot_token(token: str) -> None:
@@ -417,6 +471,103 @@ def send_telegram(token: str, chat_id: str, text: str, *, copy_text: str | None 
     telegram(token, "sendMessage", payload)
 
 
+def normalize_discord_webhook_url(value: str) -> str:
+    """Accept only Discord's canonical HTTPS webhook endpoint (SSRF defense)."""
+    try:
+        parsed = urllib.parse.urlsplit(value.strip())
+        port = parsed.port
+    except ValueError as exc:
+        raise BridgeError("Discord Webhook URL 格式无效。") from exc
+    if (
+        parsed.scheme != "https"
+        or parsed.hostname != "discord.com"
+        or parsed.username
+        or parsed.password
+        or port not in (None, 443)
+        or parsed.query
+        or parsed.fragment
+        or not re.fullmatch(r"/api/webhooks/\d{6,24}/[A-Za-z0-9._-]{20,256}", parsed.path)
+    ):
+        raise BridgeError("只接受 https://discord.com/api/webhooks/... 格式的官方 Discord Webhook URL。")
+    return urllib.parse.urlunsplit(("https", "discord.com", parsed.path, "", ""))
+
+
+class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Never follow provider redirects with a credential-bearing URL."""
+
+    def redirect_request(self, *_args: object, **_kwargs: object) -> None:
+        return None
+
+
+def discord_webhook_request(
+    webhook_url: str,
+    payload: dict | None = None,
+    *,
+    retries: int = 3,
+) -> dict:
+    """Validate or execute a Discord webhook without leaking its URL in errors."""
+    canonical = normalize_discord_webhook_url(webhook_url)
+    target = canonical if payload is None else canonical + "?wait=true"
+    request = urllib.request.Request(
+        target,
+        data=json.dumps(payload).encode("utf-8") if payload is not None else None,
+        headers={
+            "Content-Type": "application/json",
+            "User-Agent": "SMS-Bridge/0.1",
+        },
+        method="POST" if payload is not None else "GET",
+    )
+    opener = urllib.request.build_opener(NoRedirectHandler())
+    for attempt in range(retries):
+        try:
+            with opener.open(request, timeout=15) as response:
+                raw = response.read(MAX_DISCORD_RESPONSE_BYTES + 1)
+                if len(raw) > MAX_DISCORD_RESPONSE_BYTES:
+                    raise BridgeError("Discord 响应异常过大，已安全中止。")
+                if not raw:
+                    return {"ok": True}
+                body = json.loads(raw)
+            if payload is None and not isinstance(body, dict):
+                raise BridgeError("Discord Webhook 返回了无效响应。")
+            return body if isinstance(body, dict) else {"ok": True}
+        except urllib.error.HTTPError as exc:
+            if exc.code in (401, 403, 404):
+                raise BridgeError("Discord Webhook 无效或已被删除，请重新复制 URL。") from exc
+            if 400 <= exc.code < 500 and exc.code != 429:
+                raise BridgeError("Discord 拒绝了通知，请检查 Webhook 设置。") from exc
+            reason = f"HTTP {exc.code}"
+        except (urllib.error.URLError, TimeoutError):
+            reason = "网络连接失败"
+        except json.JSONDecodeError:
+            reason = "Discord 返回了无效响应"
+        if attempt + 1 < retries:
+            time.sleep(2 ** attempt)
+    raise TransientProviderError(f"Discord 暂时不可用（{reason}），稍后会自动重试。")
+
+
+def configure_discord_webhook(value: str) -> None:
+    """Validate before storing, then enable only for future messages."""
+    canonical = normalize_discord_webhook_url(value)
+    discord_webhook_request(canonical, retries=1)
+    with AUTHORIZATION_LOCK:
+        save_discord_webhook_url(canonical)
+        STATE.set("discord_enabled", "1")
+        STATE.set("provider_cursor_discord", STATE.get("last_rowid") or "0")
+
+
+def discord_enabled() -> bool:
+    return STATE.get("discord_enabled") == "1"
+
+
+def set_discord_enabled(enabled: bool) -> None:
+    if enabled and not discord_webhook_url():
+        raise BridgeError("请先保存 Discord Webhook URL。")
+    with AUTHORIZATION_LOCK:
+        STATE.set("discord_enabled", "1" if enabled else "0")
+        if enabled:
+            STATE.set("provider_cursor_discord", STATE.get("last_rowid") or "0")
+
+
 def token_hash(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
 
@@ -469,8 +620,8 @@ def launch_agent_plist() -> str:
 
 def install_launch_agent() -> None:
     """Install a current-user service without placing secrets in its plist."""
-    if not keychain_token():
-        raise BridgeError("请先在设置页保存 Bot Token，再安装自动启动服务。")
+    if not keychain_token() and not (discord_webhook_url() and discord_enabled()):
+        raise BridgeError("请先配置至少一个通知渠道，再安装自动启动服务。")
     for legacy_label in LEGACY_LAUNCH_AGENT_LABELS:
         remove_launch_agent(legacy_label)
     label = LAUNCH_AGENT_LABEL
@@ -505,6 +656,7 @@ def reset_local_configuration() -> None:
     # Ask Keychain first so a cancelled authorization does not leave a half-reset service.
     with AUTHORIZATION_LOCK:
         delete_keychain_token()
+        delete_discord_webhook_url()
         uninstall_launch_agent()
         STATE.secure_clear()
     for log_name in ("sms-bridge.log", "sms-bridge.error.log"):
@@ -556,7 +708,11 @@ def scrub_legacy_configuration(root: Path = ROOT) -> None:
     if legacy_env.is_file() and not legacy_env.is_symlink():
         retained = [
             line for line in legacy_env.read_text(encoding="utf-8").splitlines()
-            if not re.match(r"^\s*(?:export\s+)?(?:TELEGRAM_BOT_TOKEN|TELEGRAM_CHAT_ID)\s*=", line)
+            if not re.match(
+                r"^\s*(?:export\s+)?"
+                r"(?:TELEGRAM_BOT_TOKEN|TELEGRAM_CHAT_ID|DISCORD_WEBHOOK_URL)\s*=",
+                line,
+            )
         ]
         meaningful = [line for line in retained if line.strip() and not line.lstrip().startswith("#")]
         if meaningful:
@@ -594,6 +750,22 @@ def doctor() -> dict:
             checks["telegram"] = {"ok": False, "detail": str(exc)}
     else:
         checks["telegram"] = {"ok": False, "detail": "需要先设置 Bot Token"}
+    try:
+        webhook = discord_webhook_url()
+        discord_error = ""
+    except BridgeError as exc:
+        webhook, discord_error = None, str(exc)
+    if webhook:
+        try:
+            discord_webhook_request(webhook, retries=1)
+            checks["discord"] = {
+                "ok": True,
+                "detail": "Webhook 可用并已启用" if discord_enabled() else "Webhook 可用但当前停用",
+            }
+        except BridgeError as exc:
+            checks["discord"] = {"ok": False, "detail": str(exc)}
+    else:
+        checks["discord"] = {"ok": False, "detail": discord_error or "未配置（可选）"}
     label = LAUNCH_AGENT_LABEL
     agent = Path.home() / "Library/LaunchAgents" / f"{label}.plist"
     loaded = subprocess.run(
@@ -811,6 +983,108 @@ def set_forward_mode(value: str) -> None:
     STATE.set("forward_mode", value)
 
 
+@dataclass(frozen=True)
+class OutboundNotification:
+    """Provider-neutral notification data; secrets and message text are not persisted."""
+
+    label: str
+    service: str
+    sender: str
+    received_at: str
+    code: str | None = None
+    original: str | None = None
+    test: bool = False
+
+
+def build_notification(
+    text: str,
+    sender: str,
+    *,
+    received_at: str | None = None,
+    test: bool = False,
+    code: str | None = None,
+    full_message: bool = False,
+) -> OutboundNotification:
+    code = code or (None if full_message else parse_otp(text))
+    if not code and not full_message:
+        raise BridgeError("消息中未找到验证码。")
+    return OutboundNotification(
+        label="收到新消息" if full_message else code_label(text),
+        service="" if full_message else service_name(text),
+        sender=(sender or "未知发件人")[:256],
+        received_at=received_at or datetime.now().astimezone().strftime("%H:%M"),
+        code=code,
+        original=text[:MAX_PREVIEW_LENGTH] if full_message or preview_enabled() else None,
+        test=test,
+    )
+
+
+def render_telegram_notification(notification: OutboundNotification) -> str:
+    safe_sender = html.escape(notification.sender)
+    time_label = html.escape(notification.received_at)
+    icon = "🧪" if notification.test else "✉️"
+    service_suffix = (
+        ""
+        if notification.service in ("", "验证码")
+        else f" · {html.escape(notification.service)}"
+    )
+    if notification.code:
+        body = (
+            f"{icon}  <b>{html.escape(notification.label)}{service_suffix}</b>\n\n"
+            f"🔐  <b>{html.escape(format_code(notification.code))}</b>\n\n\n"
+            f"<b>来自</b>  {safe_sender}\n"
+            f"<b>时间</b>  <code>{time_label}</code>"
+        )
+    else:
+        body = (
+            f"{icon}  <b>{safe_sender}</b>  ·  <code>{time_label}</code>\n\n"
+            f"<b>{html.escape(notification.label)}</b>"
+        )
+    if notification.test:
+        body += "\n\n<i>模拟通知 · 不是真实短信</i>"
+    if notification.original is not None:
+        preview = html.escape(notification.original)
+        body += "\n\n<b>短信原文</b>（点击展开）\n<blockquote expandable>" + preview + "</blockquote>"
+    return body
+
+
+def discord_escape(value: str) -> str:
+    """Escape Discord Markdown while allowed_mentions blocks actual pings."""
+    return re.sub(r"([\\`*_{}\[\]()<>#+.!|>~-])", r"\\\1", value)
+
+
+def render_discord_notification(notification: OutboundNotification) -> str:
+    icon = "🧪" if notification.test else "✉️"
+    service_suffix = (
+        ""
+        if notification.service in ("", "验证码")
+        else f" · {discord_escape(notification.service)}"
+    )
+    if notification.code:
+        body = (
+            f"{icon} **{discord_escape(notification.label)}{service_suffix}**\n\n"
+            f"# 🔐 {discord_escape(format_code(notification.code))}\n\n"
+            f"**来自**  {discord_escape(notification.sender)}\n"
+            f"**时间**  `{discord_escape(notification.received_at)}`"
+        )
+    else:
+        body = (
+            f"{icon} **{discord_escape(notification.label)}**\n\n"
+            f"**来自**  {discord_escape(notification.sender)}\n"
+            f"**时间**  `{discord_escape(notification.received_at)}`"
+        )
+    if notification.test:
+        body += "\n\n*模拟通知 · 不是真实短信*"
+    if notification.original is not None:
+        remaining = max(0, MAX_DISCORD_MESSAGE_LENGTH - len(body) - 20)
+        escaped = discord_escape(notification.original)[:remaining].rstrip("\\")
+        quoted = "\n".join("> " + line for line in escaped.splitlines() or [""])
+        body += "\n\n**短信原文**\n" + quoted
+    if len(body) > MAX_DISCORD_MESSAGE_LENGTH:
+        raise BridgeError("Discord 通知内容过长，已安全拒绝发送。")
+    return body
+
+
 def format_notification(
     text: str,
     sender: str,
@@ -819,29 +1093,16 @@ def format_notification(
     test: bool = False,
     code: str | None = None,
 ) -> str:
-    """Render useful context without persisting an OTP or message body."""
-    code = code or parse_otp(text)
-    if not code:
-        raise BridgeError("消息中未找到验证码。")
-    safe_sender = html.escape((sender or "未知发件人")[:256])
-    icon = "🧪" if test else "✉️"
-    time_label = html.escape(received_at or datetime.now().astimezone().strftime("%H:%M"))
-    service = service_name(text)
-    label = code_label(text)
-    service_suffix = "" if service == "验证码" else f" · {html.escape(service)}"
-    body = (
-        f"{icon}  <b>{label}{service_suffix}</b>\n\n"
-        f"🔐  <b>{html.escape(format_code(code))}</b>\n\n\n"
-        f"<b>来自</b>  {safe_sender}\n"
-        f"<b>时间</b>  <code>{time_label}</code>"
+    """Backward-compatible Telegram renderer used by the public helpers/tests."""
+    return render_telegram_notification(
+        build_notification(
+            text,
+            sender,
+            received_at=received_at,
+            test=test,
+            code=code,
+        )
     )
-    if test:
-        body += "\n\n<i>模拟通知 · 不是真实短信</i>"
-    if preview_enabled():
-        preview = html.escape(text[:MAX_PREVIEW_LENGTH])
-        suffix = "\n\n<b>短信原文</b>（点击展开）\n<blockquote expandable>" + preview + "</blockquote>"
-        body += suffix
-    return body
 
 
 def format_message_notification(
@@ -850,14 +1111,101 @@ def format_message_notification(
     *,
     received_at: str | None = None,
 ) -> str:
-    """Render a bounded full-text notification for explicit all-message mode."""
-    safe_sender = html.escape((sender or "未知发件人")[:256])
-    time_label = html.escape(received_at or datetime.now().astimezone().strftime("%H:%M"))
-    preview = html.escape(text[:MAX_PREVIEW_LENGTH])
-    return (
-        f"✉️  <b>{safe_sender}</b>  ·  <code>{time_label}</code>\n\n"
-        f"<b>收到新消息</b>\n<blockquote expandable>{preview}</blockquote>"
+    return render_telegram_notification(
+        build_notification(
+            text,
+            sender,
+            received_at=received_at,
+            full_message=True,
+        )
     )
+
+
+class NotificationProvider:
+    provider_id = ""
+    display_name = ""
+
+    def send(self, notification: OutboundNotification) -> None:
+        raise NotImplementedError
+
+
+@dataclass(frozen=True)
+class TelegramProvider(NotificationProvider):
+    token: str
+    chat_id: str
+    provider_id = "telegram"
+    display_name = "Telegram"
+
+    def send(self, notification: OutboundNotification) -> None:
+        send_telegram(
+            self.token,
+            self.chat_id,
+            render_telegram_notification(notification),
+            copy_text=notification.code,
+        )
+
+
+@dataclass(frozen=True)
+class DiscordWebhookProvider(NotificationProvider):
+    webhook_url: str
+    provider_id = "discord"
+    display_name = "Discord"
+
+    def send(self, notification: OutboundNotification) -> None:
+        discord_webhook_request(
+            self.webhook_url,
+            {
+                "content": render_discord_notification(notification),
+                "username": APP_NAME,
+                "allowed_mentions": {"parse": []},
+            },
+        )
+
+
+def active_notification_providers() -> list[NotificationProvider]:
+    providers: list[NotificationProvider] = []
+    token = keychain_token()
+    chat_id = STATE.get("paired_chat_id")
+    if token and chat_id:
+        providers.append(TelegramProvider(token, chat_id))
+    if discord_enabled():
+        webhook = discord_webhook_url()
+        if not webhook:
+            raise BridgeError("Discord 已启用但 Webhook URL 不存在，请重新配置或停用。")
+        providers.append(DiscordWebhookProvider(webhook))
+    return providers
+
+
+def provider_delivery_key(provider_id: str) -> str:
+    return f"provider_cursor_{provider_id}"
+
+
+def send_test_notification(provider_id: str | None = None) -> list[str]:
+    notification = build_notification(
+        "Your Google verification code is 482913.",
+        "+1 555 010 1234",
+        test=True,
+    )
+    if provider_id == "telegram":
+        token, chat = keychain_token(), STATE.get("paired_chat_id")
+        providers: list[NotificationProvider] = (
+            [TelegramProvider(token, chat)] if token and chat else []
+        )
+    elif provider_id == "discord":
+        webhook = discord_webhook_url()
+        providers = [DiscordWebhookProvider(webhook)] if webhook else []
+    elif provider_id in (None, "all"):
+        providers = active_notification_providers()
+    else:
+        raise BridgeError("未知的通知渠道。")
+    if not providers:
+        raise BridgeError("所选通知渠道尚未完成配置。")
+    delivered: list[str] = []
+    with AUTHORIZATION_LOCK:
+        for provider in providers:
+            provider.send(notification)
+            delivered.append(provider.provider_id)
+    return delivered
 
 
 def bridge_loop() -> None:
@@ -870,7 +1218,6 @@ def bridge_loop() -> None:
                 # Start at "now": installation must never dump historical messages.
                 STATE.set("last_rowid", str(latest_rowid()))
             cursor = int(STATE.get("last_rowid") or "0")
-            chat_id = STATE.get("paired_chat_id")
             messages = fetch_messages(cursor)
             STATE.set("messages_readable", "1")
             STATE.set("messages_checked_at", str(int(time.time())))
@@ -883,33 +1230,30 @@ def bridge_loop() -> None:
                     continue
                 code = parse_otp(text, allow_compact=mode in ("smart", "all"))
                 should_forward = bool(code) or mode == "all"
-                if should_forward and token:
+                if should_forward:
                     with AUTHORIZATION_LOCK:
-                        current_chat_id = STATE.get("paired_chat_id")
                         if STOP.is_set():
                             return
-                        if current_chat_id and current_chat_id == chat_id:
-                            received_at = message_time_label(message["date"])
-                            notification = (
-                                format_notification(
-                                    text,
-                                    str(message["sender"]),
-                                    received_at=received_at,
-                                    code=code,
-                                )
-                                if code
-                                else format_message_notification(
-                                    text,
-                                    str(message["sender"]),
-                                    received_at=received_at,
-                                )
+                        providers = active_notification_providers()
+                        received_at = message_time_label(message["date"])
+                        notification = build_notification(
+                            text,
+                            str(message["sender"]),
+                            received_at=received_at,
+                            code=code,
+                            full_message=not bool(code),
+                        )
+                        for provider in providers:
+                            delivery_key = provider_delivery_key(provider.provider_id)
+                            if int(STATE.get(delivery_key) or "0") >= rowid:
+                                continue
+                            provider.send(notification)
+                            STATE.set(delivery_key, str(rowid))
+                            STATE.set(
+                                f"last_forwarded_at_{provider.provider_id}",
+                                str(int(time.time())),
                             )
-                            send_telegram(
-                                token,
-                                current_chat_id,
-                                notification,
-                                copy_text=code,
-                            )
+                        if providers:
                             STATE.set("last_forwarded_at", str(int(time.time())))
                 STATE.set("last_rowid", str(rowid))
             STATE.delete("last_error")
@@ -951,8 +1295,40 @@ def status() -> dict:
         keychain_error = ""
     except BridgeError as exc:
         configured, keychain_error = False, str(exc)
+    try:
+        discord_configured = bool(discord_webhook_url())
+        discord_error = ""
+    except BridgeError as exc:
+        discord_configured, discord_error = False, str(exc)
     messages_readable, _messages_detail = messages_access_status()
-    return {"configured": configured, "messagesReadable": messages_readable, "paired": paired, "pairedName": STATE.get("paired_chat_name") or ("Telegram 私聊" if paired else ""), "pairingActive": pair_expires > time.time(), "pairingRemaining": max(0, pair_expires - int(time.time())), "showOriginal": preview_enabled(), "forwardMode": forward_mode(), "lastError": keychain_error or STATE.get("last_error") or "", "lastForwardedAt": int(STATE.get("last_forwarded_at") or "0")}
+    discord_active = discord_configured and discord_enabled()
+    return {
+        "configured": configured,
+        "messagesReadable": messages_readable,
+        "paired": paired,
+        "pairedName": STATE.get("paired_chat_name") or ("Telegram 私聊" if paired else ""),
+        "pairingActive": pair_expires > time.time(),
+        "pairingRemaining": max(0, pair_expires - int(time.time())),
+        "showOriginal": preview_enabled(),
+        "forwardMode": forward_mode(),
+        "discordConfigured": discord_configured,
+        "discordEnabled": discord_active,
+        "hasActiveProvider": bool((configured and paired) or discord_active),
+        "providers": {
+            "telegram": {
+                "configured": configured,
+                "enabled": paired,
+                "ready": bool(configured and paired),
+            },
+            "discord": {
+                "configured": discord_configured,
+                "enabled": discord_active,
+                "ready": discord_active,
+            },
+        },
+        "lastError": keychain_error or discord_error or STATE.get("last_error") or "",
+        "lastForwardedAt": int(STATE.get("last_forwarded_at") or "0"),
+    }
 
 
 PAGE = render_page(CSRF_TOKEN)
@@ -1012,20 +1388,17 @@ class Handler(BaseHTTPRequestHandler):
                 value = str(data.get("token", "")).strip()
                 if len(value) < 20 or ":" not in value: raise RuntimeError("请输入完整的 Bot Token。")
                 configure_bot_token(value); self.respond(200, {"ok": True})
+            elif self.path == "/api/discord":
+                value = str(data.get("webhookUrl", "")).strip()
+                configure_discord_webhook(value)
+                self.respond(200, {"ok": True})
             elif self.path == "/api/pair": self.respond(200, {"url": create_pairing()})
             elif self.path == "/api/test":
-                chat = STATE.get("paired_chat_id")
-                if not chat: raise RuntimeError("请先完成 Telegram 配对。")
-                send_telegram(
-                    require_token(),
-                    chat,
-                    format_notification(
-                        "Your Google verification code is 482913.",
-                        "+1 555 010 1234",
-                        test=True,
-                    ),
-                    copy_text="482913",
-                )
+                delivered = send_test_notification(str(data.get("provider") or "all"))
+                self.respond(200, {"ok": True, "providers": delivered})
+            elif self.path == "/api/discord/remove":
+                with AUTHORIZATION_LOCK:
+                    delete_discord_webhook_url()
                 self.respond(200, {"ok": True})
             elif self.path == "/api/settings":
                 if "showOriginal" in data:
@@ -1035,12 +1408,18 @@ class Handler(BaseHTTPRequestHandler):
                     set_preview_enabled(value)
                 if "forwardMode" in data:
                     set_forward_mode(str(data["forwardMode"]))
-                if not {"showOriginal", "forwardMode"}.intersection(data):
+                if "discordEnabled" in data:
+                    value = data["discordEnabled"]
+                    if not isinstance(value, bool):
+                        raise BridgeError("discordEnabled 必须是 true 或 false。")
+                    set_discord_enabled(value)
+                if not {"showOriginal", "forwardMode", "discordEnabled"}.intersection(data):
                     raise BridgeError("没有可更新的设置。")
                 self.respond(200, {
                     "ok": True,
                     "showOriginal": preview_enabled(),
                     "forwardMode": forward_mode(),
+                    "discordEnabled": discord_enabled(),
                 })
             elif self.path == "/api/unpair": unpair(); self.respond(200, {"ok": True})
             elif self.path == "/api/install":
@@ -1096,7 +1475,7 @@ def serve(open_browser: bool) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="本机 iPhone 验证码 → Telegram 工具",
+        description="本机 iPhone 验证码 → Telegram / Discord 通知工具",
         epilog="不带命令时启动本机设置页；所有敏感配置只保留在本机。",
     )
     commands = parser.add_subparsers(dest="command", metavar="命令")
@@ -1106,15 +1485,29 @@ def main() -> None:
     commands.add_parser("run", help="仅运行转发服务，不启动设置页")
     commands.add_parser("pair", help="生成 10 分钟有效的一次性 Telegram 配对链接")
     commands.add_parser("status", help="显示不含敏感信息的本机状态")
-    commands.add_parser("doctor", help="检查权限、钥匙串、Telegram 和常驻服务")
-    commands.add_parser("test", help="向已配对私聊发送测试通知")
+    commands.add_parser("doctor", help="检查权限、钥匙串、通知渠道和常驻服务")
+    test_command = commands.add_parser("test", help="向已启用渠道发送测试通知")
+    test_command.add_argument(
+        "--provider",
+        choices=("all", "telegram", "discord"),
+        default="all",
+        help="测试全部、Telegram 或 Discord（默认：all）",
+    )
     commands.add_parser("unpair", help="解除当前 Telegram 私聊授权")
     config = commands.add_parser("config", help="查看或修改通知显示选项")
-    config.add_argument("--show-original", choices=("on", "off"), help="是否在 Telegram 通知中附带完整原文")
+    config.add_argument("--show-original", choices=("on", "off"), help="是否在所有已启用渠道中附带完整原文")
     config.add_argument("--mode", choices=FORWARD_MODES, help="转发规则：strict、smart 或 all")
+    discord_command = commands.add_parser("discord", help="配置 Discord Webhook 通知")
+    discord_actions = discord_command.add_subparsers(dest="discord_action", metavar="操作")
+    discord_actions.add_parser("set", help="隐藏输入并保存 Webhook URL")
+    discord_actions.add_parser("test", help="发送一条 Discord 模拟通知")
+    discord_actions.add_parser("enable", help="启用已保存的 Discord Webhook")
+    discord_actions.add_parser("disable", help="暂时停用 Discord Webhook")
+    discord_actions.add_parser("remove", help="删除 Discord Webhook 凭据")
+    discord_actions.add_parser("status", help="显示 Discord 脱敏状态")
     commands.add_parser("install", help="安装当前用户登录后自动启动服务")
     commands.add_parser("uninstall", help="移除当前用户的自动启动服务")
-    reset = commands.add_parser("reset", help="删除 Token、配对、状态和常驻服务")
+    reset = commands.add_parser("reset", help="删除渠道凭据、配对、状态和常驻服务")
     reset.add_argument("--yes", action="store_true", help="确认永久删除本机 SMS Bridge 配置")
     args = parser.parse_args()
     signal.signal(signal.SIGINT, stop_handler); signal.signal(signal.SIGTERM, stop_handler)
@@ -1151,19 +1544,8 @@ def main() -> None:
     elif command == "doctor":
         print(json.dumps(doctor(), ensure_ascii=False, indent=2))
     elif command == "test":
-        chat = STATE.get("paired_chat_id")
-        if not chat: raise BridgeError("尚未配对。请先运行：sms_bridge.py pair")
-        send_telegram(
-            require_token(),
-            chat,
-            format_notification(
-                "Your Google verification code is 482913.",
-                "+1 555 010 1234",
-                test=True,
-            ),
-            copy_text="482913",
-        )
-        print("测试通知已发送。")
+        delivered = send_test_notification(args.provider)
+        print("测试通知已发送：" + "、".join(delivered))
     elif command == "unpair":
         unpair(); print("已解除 Telegram 配对。")
     elif command == "config":
@@ -1175,6 +1557,31 @@ def main() -> None:
             "showOriginal": preview_enabled(),
             "forwardMode": forward_mode(),
         }, ensure_ascii=False, indent=2))
+    elif command == "discord":
+        action = args.discord_action or "status"
+        if action == "set":
+            webhook = getpass.getpass("Discord Webhook URL（输入不会显示）: ").strip()
+            configure_discord_webhook(webhook)
+            print("Discord Webhook 已验证、保存到 macOS 钥匙串并启用。")
+        elif action == "test":
+            send_test_notification("discord")
+            print("Discord 测试通知已发送。")
+        elif action == "enable":
+            set_discord_enabled(True)
+            print("Discord Webhook 已启用；只转发之后收到的新消息。")
+        elif action == "disable":
+            set_discord_enabled(False)
+            print("Discord Webhook 已停用，凭据仍保存在钥匙串。")
+        elif action == "remove":
+            with AUTHORIZATION_LOCK:
+                delete_discord_webhook_url()
+            print("Discord Webhook 已从钥匙串删除。")
+        elif action == "status":
+            configured = bool(discord_webhook_url())
+            print(json.dumps({
+                "configured": configured,
+                "enabled": configured and discord_enabled(),
+            }, ensure_ascii=False, indent=2))
     elif command == "install":
         install_launch_agent(); print("已安装登录后自动启动服务。")
     elif command == "uninstall":
@@ -1183,8 +1590,8 @@ def main() -> None:
         if not args.yes:
             raise BridgeError("此操作会永久删除本机配置。确认后请重新运行：sms_bridge.py reset --yes")
         reset_local_configuration()
-        print("已删除钥匙串 Token、Telegram 配对、本机状态、日志和常驻服务。")
-        print("请另行在 @BotFather 撤销 Token，并在系统设置中移除专用 Python 的完全磁盘访问权限。")
+        print("已删除通知渠道凭据、Telegram 配对、本机状态、日志和常驻服务。")
+        print("请另行撤销 Telegram Token、删除 Discord 服务端 Webhook，并移除专用 Python 的完全磁盘访问权限。")
 
 
 if __name__ == "__main__":

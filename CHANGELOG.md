@@ -13,6 +13,8 @@ All notable changes are documented in this file.
 - Configurable strict OTP, smart OTP, and explicit all-message forwarding rules in both UI and CLI.
 - Dependency-free decoding of modern macOS Messages `attributedBody` typedstreams when the legacy `text` column is empty.
 - Pickup-code recognition for labelled collection messages and compound codes such as `3-7-2468`, with tracking-number suffixes excluded.
+- Provider-neutral notification model with Telegram and Discord renderers.
+- Optional Discord Incoming Webhook delivery, setup UI, CLI controls, provider-specific tests, and per-provider retry cursors.
 
 ### Security
 
@@ -21,3 +23,4 @@ All notable changes are documented in this file.
 - Long previews are bounded before HTML rendering, preventing broken Telegram markup.
 - OTP and pickup-code notifications prioritize a bold, unobstructed code line, retain sender and received time, and provide a native clipboard button.
 - Strict OTP remains the default; enabling all-message mode requires an explicit privacy warning because ordinary SMS and iMessage text is transmitted.
+- Discord credentials are Keychain-only; webhook URLs are restricted to canonical Discord HTTPS endpoints, redirects and mentions are disabled, and URLs never appear in status or errors.

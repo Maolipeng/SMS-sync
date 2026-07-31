@@ -6,7 +6,7 @@ body:
   - type: markdown
     attributes:
       value: |
-        **Never paste a Bot Token, OTP, pairing link, Chat ID, full SMS, `.env`, state database, or unredacted log here.**
+        **Never paste a Bot Token, Discord Webhook URL, OTP, pairing link, Chat ID, full SMS, `.env`, state database, or unredacted log here.**
         For a possible security vulnerability, follow SECURITY.md and report it privately.
   - type: textarea
     id: description

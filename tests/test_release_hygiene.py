@@ -16,8 +16,12 @@ class ReleaseHygieneTests(unittest.TestCase):
         self.assertEqual(example.split("TELEGRAM_BOT_TOKEN=", 1)[1].splitlines()[0], "")
 
     def test_source_does_not_hardcode_a_bot_token(self):
-        source = "\n".join(path.read_text() for path in ROOT.glob("*.py"))
+        source = "\n".join(path.read_text() for path in ROOT.rglob("*") if path.suffix in (".py", ".md", ".yml"))
         self.assertNotRegex(source, r"\d{7,}:AA[A-Za-z0-9_-]{20,}")
+        self.assertNotRegex(
+            source,
+            r"https://discord\.com/api/webhooks/\d{6,24}/[A-Za-z0-9._-]{20,}",
+        )
 
     def test_keychain_write_does_not_pass_secret_in_process_arguments(self):
         source = (ROOT / "sms_bridge.py").read_text()

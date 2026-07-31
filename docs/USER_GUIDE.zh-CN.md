@@ -1,8 +1,8 @@
 # SMS Bridge 用户手册
 
-本文面向第一次使用命令行或第一次创建 Telegram Bot 的用户。高级用户可直接阅读文末的 CLI 部分。
+本文面向第一次配置通知渠道的用户。高级用户可直接阅读文末的 CLI 部分。
 
-> SMS Bridge 会处理登录验证码。Telegram Bot 私聊不是 Telegram「私密聊天」，消息会经过 Telegram 基础设施。请只在你理解并接受这一点时使用；金融、医疗、企业或其他高风险账户可能禁止转发验证码。
+> SMS Bridge 会处理登录验证码。Telegram Bot 私聊和 Discord 频道都不是端到端加密的私密存储；消息会经过所选平台的基础设施。请只在你理解并接受这一点时使用；金融、医疗、企业或其他高风险账户可能禁止转发验证码。
 
 ## 1. 使用前检查
 
@@ -11,8 +11,8 @@
 - macOS 设备和 Python 3.10 或更高版本；
 - 与 iPhone 登录同一 Apple 账户的 Mac；
 - Mac「信息」App 已能看到 iPhone 收到的短信；
-- 一个专用于 SMS Bridge 的 Telegram Bot；
-- 一个启用了两步验证、只有你能访问的 Telegram 账户。
+- 至少一个通知渠道：专用 Telegram Bot，或只有你能访问的 Discord 私密频道 Webhook；
+- 为相关平台账户启用两步验证。
 
 先给 iPhone 发送一条普通测试短信，确认它出现在 Mac 的「信息」App。SMS Bridge 不会绕过 Apple 同步，也无法读取尚未同步到 Mac 的内容。
 
@@ -25,16 +25,26 @@
 
 不要让同一个 Bot 同时被其他机器人框架轮询，否则它们可能争抢 `getUpdates`。
 
+### 可选：创建 Discord Webhook
+
+1. 在 Discord 创建或选择一个只有你能访问的私密文字频道；
+2. 打开频道设置 → 整合 → Webhook，新建一个 Webhook；
+3. 复制 Webhook URL，并像密码一样保护它；
+4. 在 SMS Bridge 设置页粘贴 URL，点击“验证并保存”；
+5. URL 验证成功后会写入 macOS 钥匙串，页面不会再次显示。
+
+Discord Webhook 发到频道而不是私聊。SMS Bridge 只接受 `https://discord.com/api/webhooks/...` 官方地址，不跟随重定向，也不会触发 `@everyone`、用户或角色提醒。
+
 ## 3. 图形化安装
 
 1. 下载并解压项目源代码；
 2. 双击 `SMS Bridge.command`；
 3. 启动器首次运行会创建一份仅供 SMS Bridge 使用、权限为当前用户所有的 Python 运行时，然后浏览器会打开仅本机可访问的设置页；
-4. 粘贴 Bot Token 并点击“安全保存”；
-5. 如 macOS 弹出钥匙串确认，只在提示的程序是你刚启动的 Python/SMS Bridge 时允许。首次使用或 Python 路径变化时可能需要确认一次；同一进程会在内存中缓存 Token，不会每几秒重复读取钥匙串；
-6. 点击“生成配对链接”，在 Telegram 中打开并点击“启动”；
-7. 返回设置页，发送模拟测试通知；
-8. 确认发件人、验证码和“模拟消息”标识均正确后，点击“安装后台常驻”。
+4. 至少完成一个渠道：粘贴 Telegram Bot Token 并配对私聊，或粘贴 Discord Webhook URL；
+5. 如 macOS 弹出钥匙串确认，只在提示的程序是你刚启动的 Python/SMS Bridge 时允许。首次使用或 Python 路径变化时，每个渠道凭据可能需要确认一次；同一进程会在内存中缓存凭据；
+6. 分别点击渠道测试，或点击“发送测试通知”测试所有已启用渠道；
+7. 确认发件人、验证码和“模拟消息”标识均正确；
+8. 点击“安装后台常驻”。
 
 安装后台常驻后设置页会关闭，LaunchAgent 会接管转发。它只属于当前 macOS 用户，不需要管理员权限，也不会把 Token 写入 plist。
 
@@ -60,18 +70,18 @@
 
 🔐 验证码 · Google
 
-4  8  2  9  1  3
+482913
 
 [📋 复制验证码]
 ```
 
-Telegram 不允许 Bot 自定义真正的卡片字号，但 SMS Bridge 会使用独立粗体行和额外留白突出验证码，避开部分手机端会遮住末位数字的代码块。下方的“复制验证码”按钮复制原始验证码。默认不会发送完整短信正文或附件。开启“附带短信原文”后，原文会以默认折叠、可点击展开的引用块发送，但 SMS Bridge 仍不会建立本地验证码历史。长原文会安全截断，不会破坏 Telegram 消息格式。
+Telegram 不允许 Bot 自定义真正的卡片字号，但 SMS Bridge 会使用独立粗体行和额外留白突出验证码，避开部分手机端会遮住末位数字的代码块，并提供“复制验证码”按钮。Discord 使用大号 Markdown 标题突出验证码。默认不会发送完整短信正文或附件。开启“附带短信原文”后，原文会发送至所有已启用渠道，但 SMS Bridge 仍不会建立本地验证码历史；每个平台都会按自身长度安全截断。
 
 转发规则有三档：
 
 - **严格验证码（默认）**：同时包含验证码语义（如 `code`、`verification`、`OTP`、`验证码`）和 4–8 位数字；也识别明确标注的取件码、收件码、提货码，以及“凭 3-7-2468 到驿站”这类格式，并优先于运单尾号；
 - **智能验证码**：在严格规则之外，兼容较短、只有一段数字且数字位于开头或结尾的中文短信，同时排除订单、余额、金额、电话、会议等常见误报；
-- **所有收到的文本**：转发普通短信和 iMessage；因为普通消息没有验证码可突出，通知会携带原文。此模式可能把私人对话发送到 Telegram，只有明确接受风险后才应开启。
+- **所有收到的文本**：转发普通短信和 iMessage；因为普通消息没有验证码可突出，通知会携带原文。此模式可能把私人对话发送到所有已启用渠道，只有明确接受风险后才应开启。
 
 规则仍可能误报或漏报，因此不要把本工具当作保证投递系统。
 
@@ -83,6 +93,8 @@ Telegram 不允许 Bot 自定义真正的卡片字号，但 SMS Bridge 会使用
 python3 sms_bridge.py init
 python3 sms_bridge.py pair
 python3 sms_bridge.py test
+python3 sms_bridge.py discord set
+python3 sms_bridge.py discord test
 python3 sms_bridge.py install
 ```
 
@@ -97,17 +109,24 @@ python3 sms_bridge.py config --show-original off
 python3 sms_bridge.py config --mode strict
 python3 sms_bridge.py config --mode smart
 python3 sms_bridge.py config --mode all
+python3 sms_bridge.py test --provider telegram
+python3 sms_bridge.py test --provider discord
+python3 sms_bridge.py discord status
+python3 sms_bridge.py discord enable
+python3 sms_bridge.py discord disable
+python3 sms_bridge.py discord remove
 python3 sms_bridge.py unpair
 python3 sms_bridge.py uninstall
 python3 sms_bridge.py reset --yes
 ```
 
-`uninstall` 只移除后台常驻，保留配对和 Token。`reset --yes` 会永久删除钥匙串 Token、配对、本机状态、日志、专用运行时、LaunchAgent，以及旧版原型留下的 Telegram `.env` 字段、状态库和日志。它不会替你在 Telegram 撤销 Bot Token，也不能撤销 macOS 的“完全磁盘访问权限”记录。
+`uninstall` 只移除后台常驻，保留渠道配置。`reset --yes` 会永久删除钥匙串中的 Telegram Token 与 Discord Webhook、配对、本机状态、日志、专用运行时、LaunchAgent，以及旧版原型留下的 `.env` 字段、状态库和日志。它不会替你在 Telegram 撤销 Bot Token、删除 Discord 服务端 Webhook，也不能撤销 macOS 的“完全磁盘访问权限”记录。
 
 ## 6. 日常安全操作
 
 - Token 泄露：先在 `@BotFather` `/revoke`，再重新运行 `init` 或在设置页保存新 Token；保存新 Token 会自动解除旧配对。
 - Telegram 设备丢失：先从 Telegram 终止丢失设备会话，再 `/revoke` Bot Token 并重新配对。
+- Discord Webhook 泄露：立即在 Discord 频道设置中删除或重新生成 Webhook，再把新 URL 保存到 SMS Bridge。
 - Mac 转让或送修：先在 `@BotFather` 撤销 Token，在“系统设置 → 隐私与安全性 → 完全磁盘访问权限”中移除专用 `python3`，再运行 `python3 sms_bridge.py reset --yes`。
 - 暂停转发：运行 `uninstall`；临时运行可使用 `run`。
 - 系统或 Python 升级：重新运行 `doctor`，确认 Messages、钥匙串、Telegram 与 LaunchAgent 均正常。
@@ -115,8 +134,8 @@ python3 sms_bridge.py reset --yes
 ## 7. 数据保存位置
 
 - 专用 Python 运行时：`~/Library/Application Support/SMS Bridge/runtime`，仅供本工具使用；
-- Bot Token：静态存储于 macOS 钥匙串；运行时在当前进程内存中缓存，进程退出即释放；
-- 配对 Chat ID、消息游标和显示偏好：`~/Library/Application Support/SMS Bridge/state.sqlite3`；
+- Bot Token 与 Discord Webhook URL：静态存储于 macOS 钥匙串；运行时在当前进程内存中缓存，进程退出即释放；
+- 配对 Chat ID、每渠道脱敏消息游标和显示偏好：`~/Library/Application Support/SMS Bridge/state.sqlite3`；
 - 后台日志：同一目录，仅记录运行状态，不应包含 Token、验证码或短信正文；
 - Messages 数据库：仅用 SQLite `mode=ro` 直接查询，不创建持久副本；
 - 验证码历史：不保存。
@@ -144,6 +163,10 @@ python3 sms_bridge.py reset --yes
 ### Telegram 返回 Token 错误
 
 不要把 Token 发到 Issue。直接在 `@BotFather` `/revoke`，保存新的 Token 并重新配对。
+
+### Discord 测试失败
+
+确认 URL 来自目标私密频道的“整合 → Webhook”。如果 Webhook 已被删除或 URL 泄露，请在 Discord 中重新生成，而不是把完整 URL 发到 Issue。
 
 ## 9. 升级
 
