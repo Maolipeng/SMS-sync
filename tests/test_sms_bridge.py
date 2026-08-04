@@ -258,6 +258,79 @@ class PairingTests(unittest.TestCase):
             app.telegram = original
 
 
+class TelegramSmsReplyTests(unittest.TestCase):
+    def setUp(self):
+        app.STATE.clear_reply_targets()
+        app.STATE.delete("paired_chat_id")
+        app.STATE.delete("telegram_update_offset")
+
+    def tearDown(self):
+        app.STATE.clear_reply_targets()
+        app.STATE.delete("paired_chat_id")
+        app.STATE.delete("telegram_update_offset")
+
+    def test_quoted_reply_sends_once_to_the_mapped_phone_number(self):
+        calls = []
+        original_telegram = app.telegram
+        original_send_sms = app.send_sms_reply
+        try:
+            app.STATE.set("paired_chat_id", "42")
+            app.STATE.save_reply_target(88, "+1 555 010 1234")
+            app.telegram = lambda _token, method, payload=None, **_kwargs: (
+                {"result": [{"update_id": 9, "message": {
+                    "text": "收到，谢谢", "chat": {"id": 42, "type": "private"},
+                    "reply_to_message": {"message_id": 88},
+                }}]} if method == "getUpdates" else calls.append((method, payload)) or {"ok": True}
+            )
+            app.send_sms_reply = lambda recipient, text: calls.append(("sms", recipient, text))
+            app.process_bot_updates("synthetic-token")
+            self.assertIn(("sms", "+1 555 010 1234", "收到，谢谢"), calls)
+            self.assertEqual(app.STATE.get("telegram_update_offset"), "10")
+            self.assertIsNone(app.STATE.take_reply_target(88))
+        finally:
+            app.telegram = original_telegram
+            app.send_sms_reply = original_send_sms
+
+    def test_unquoted_or_non_phone_notification_cannot_send_sms(self):
+        self.assertIsNone(app.replyable_sms_recipient("person@example.com"))
+        self.assertEqual(app.replyable_sms_recipient("+1 (555) 010-1234"), "+15550101234")
+        self.assertIsNone(app.valid_sms_reply_text("\x00"))
+        self.assertIsNone(app.valid_sms_reply_text("x" * (app.MAX_SMS_REPLY_LENGTH + 1)))
+
+    def test_telegram_provider_returns_the_remote_message_id(self):
+        original = app.send_telegram
+        try:
+            app.send_telegram = lambda *_args, **_kwargs: {"ok": True, "result": {"message_id": 77}}
+            provider = app.TelegramProvider("synthetic-token", "42")
+            self.assertEqual(provider.send(app.build_notification("验证码 482913", "+15550101234")), 77)
+        finally:
+            app.send_telegram = original
+
+    def test_sms_reply_uses_a_private_temporary_payload_not_command_arguments(self):
+        original_run = app.subprocess.run
+        observed = {}
+
+        class Completed:
+            returncode = 0
+
+        def fake_run(command, **_kwargs):
+            observed["command"] = command
+            path = Path(command[-1])
+            observed["payload"] = path.read_text(encoding="utf-8")
+            observed["path"] = path
+            return Completed()
+
+        try:
+            app.subprocess.run = fake_run
+            app.send_sms_reply("+1 555 010 1234", "reply text")
+            self.assertEqual(observed["payload"], "+15550101234\x1freply text")
+            self.assertNotIn("reply text", observed["command"])
+            self.assertNotIn("+15550101234", observed["command"])
+            self.assertFalse(observed["path"].exists())
+        finally:
+            app.subprocess.run = original_run
+
+
 class TokenRotationTests(unittest.TestCase):
     def test_replacing_token_invalidates_pairing_and_update_cursor(self):
         original_telegram = app.telegram

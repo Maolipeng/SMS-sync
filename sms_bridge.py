@@ -23,6 +23,7 @@ import signal
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -58,6 +59,9 @@ MAX_REQUEST_BYTES = 8 * 1024
 MAX_TELEGRAM_RESPONSE_BYTES = 2 * 1024 * 1024
 MAX_DISCORD_RESPONSE_BYTES = 512 * 1024
 MAX_DISCORD_MESSAGE_LENGTH = 1900
+MAX_SMS_REPLY_LENGTH = 1000
+REPLY_TARGET_TTL_SECONDS = 7 * 24 * 60 * 60
+MAX_REPLY_TARGETS = 500
 CSRF_TOKEN = secrets.token_urlsafe(32)
 APPLE_MESSAGES_EPOCH = datetime(2001, 1, 1, tzinfo=timezone.utc)
 ERR_SEC_SUCCESS = 0
@@ -120,6 +124,12 @@ class State:
         self.lock = threading.Lock()
         self.conn = sqlite3.connect(STATE_DB, check_same_thread=False)
         self.conn.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        # A reply target contains only a telephone number and expiry, never SMS
+        # content.  It lets a quoted Telegram notification be routed once.
+        self.conn.execute(
+            "CREATE TABLE IF NOT EXISTS telegram_reply_targets "
+            "(message_id INTEGER PRIMARY KEY, recipient TEXT NOT NULL, expires_at INTEGER NOT NULL)"
+        )
         self.conn.commit()
         os.chmod(STATE_DB, 0o600)
 
@@ -136,6 +146,39 @@ class State:
     def delete(self, key: str) -> None:
         with self.lock:
             self.conn.execute("DELETE FROM settings WHERE key = ?", (key,))
+            self.conn.commit()
+
+    def save_reply_target(self, message_id: int, recipient: str) -> None:
+        expires_at = int(time.time()) + REPLY_TARGET_TTL_SECONDS
+        with self.lock:
+            self.conn.execute("DELETE FROM telegram_reply_targets WHERE expires_at <= ?", (int(time.time()),))
+            self.conn.execute(
+                "INSERT INTO telegram_reply_targets(message_id, recipient, expires_at) VALUES (?, ?, ?) "
+                "ON CONFLICT(message_id) DO UPDATE SET recipient = excluded.recipient, expires_at = excluded.expires_at",
+                (message_id, recipient, expires_at),
+            )
+            self.conn.execute(
+                "DELETE FROM telegram_reply_targets WHERE message_id IN "
+                "(SELECT message_id FROM telegram_reply_targets ORDER BY expires_at DESC LIMIT -1 OFFSET ?)",
+                (MAX_REPLY_TARGETS,),
+            )
+            self.conn.commit()
+
+    def take_reply_target(self, message_id: int) -> str | None:
+        """Return a live target once; consuming it prevents duplicate SMS sends."""
+        with self.lock:
+            self.conn.execute("DELETE FROM telegram_reply_targets WHERE expires_at <= ?", (int(time.time()),))
+            row = self.conn.execute(
+                "SELECT recipient FROM telegram_reply_targets WHERE message_id = ?", (message_id,)
+            ).fetchone()
+            if row:
+                self.conn.execute("DELETE FROM telegram_reply_targets WHERE message_id = ?", (message_id,))
+            self.conn.commit()
+        return str(row[0]) if row else None
+
+    def clear_reply_targets(self) -> None:
+        with self.lock:
+            self.conn.execute("DELETE FROM telegram_reply_targets")
             self.conn.commit()
 
     def secure_clear(self) -> None:
@@ -451,7 +494,7 @@ def telegram(token: str, method: str, payload: dict | None = None, retries: int 
     raise TransientTelegramError(f"Telegram 暂时不可用（{reason}），稍后会自动重试。")
 
 
-def send_telegram(token: str, chat_id: str, text: str, *, copy_text: str | None = None) -> None:
+def send_telegram(token: str, chat_id: str, text: str, *, copy_text: str | None = None) -> dict:
     # Never slice rendered HTML: doing so can leave an entity or closing tag broken.
     if len(html.unescape(re.sub(r"</?[^>]+>", "", text))) > MAX_MESSAGE_LENGTH:
         raise BridgeError("通知内容过长，已安全拒绝发送。")
@@ -468,7 +511,7 @@ def send_telegram(token: str, chat_id: str, text: str, *, copy_text: str | None 
                 "copy_text": {"text": copy_text[:256]},
             }]]
         }
-    telegram(token, "sendMessage", payload)
+    return telegram(token, "sendMessage", payload)
 
 
 def normalize_discord_webhook_url(value: str) -> str:
@@ -597,6 +640,7 @@ def unpair() -> None:
         STATE.delete("paired_chat_name")
         STATE.delete("pairing_token_hash")
         STATE.delete("pairing_expires_at")
+        STATE.clear_reply_targets()
 
 
 def launch_agent_plist() -> str:
@@ -793,6 +837,67 @@ def doctor() -> dict:
     return checks
 
 
+def replyable_sms_recipient(value: str) -> str | None:
+    """Normalize only a phone/short-code destination; email/iMessage is excluded."""
+    candidate = re.sub(r"[\s().-]", "", value)
+    if re.fullmatch(r"\+?[1-9]\d{4,19}", candidate):
+        return candidate
+    return None
+
+
+def valid_sms_reply_text(value: str) -> str | None:
+    reply_text = value.strip()
+    if not reply_text or len(reply_text) > MAX_SMS_REPLY_LENGTH or "\x1f" in reply_text or "\x00" in reply_text:
+        return None
+    return reply_text
+
+
+def send_sms_reply(recipient: str, reply_text: str) -> None:
+    """Ask the local Messages app to send one SMS without exposing text in argv/logs."""
+    normalized = replyable_sms_recipient(recipient)
+    if not normalized:
+        raise BridgeError("这条通知的发件人不是可回复的短信号码。")
+    reply_text = valid_sms_reply_text(reply_text)
+    if reply_text is None:
+        raise BridgeError(f"短信回复必须是 1–{MAX_SMS_REPLY_LENGTH} 个字符的纯文本。")
+
+    # Keep the recipient and reply out of command arguments and process output.
+    # The temporary file lives in the owner-only state directory and is removed
+    # immediately after Messages has read it.
+    payload_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=DATA_DIR, delete=False) as payload:
+            payload_path = Path(payload.name)
+            os.chmod(payload_path, 0o600)
+            payload.write(normalized + "\x1f" + reply_text)
+        script = '''on run argv
+    set payloadText to read (POSIX file (item 1 of argv)) as «class utf8»
+    set AppleScript's text item delimiters to character id 31
+    set recipient to text item 1 of payloadText
+    set replyText to text item 2 of payloadText
+    tell application "Messages"
+        set smsService to first service whose service type is SMS
+        set smsBuddy to buddy recipient of smsService
+        send replyText to smsBuddy
+    end tell
+end run'''
+        result = subprocess.run(
+            ["/usr/bin/osascript", "-l", "AppleScript", "-e", script, str(payload_path)],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise BridgeError("无法调用 macOS「信息」发送短信；请确认本机可正常发送短信。") from exc
+    finally:
+        if payload_path:
+            payload_path.unlink(missing_ok=True)
+    if result.returncode:
+        # AppleScript diagnostics can include user content, so do not surface it.
+        raise BridgeError("短信未发送。请打开「信息」确认已登录，并在系统设置中允许 SMS Bridge 自动化控制「信息」。")
+
+
 def process_bot_updates(token: str) -> None:
     offset = int(STATE.get("telegram_update_offset") or "0")
     updates = telegram(token, "getUpdates", {"offset": offset, "timeout": 0}).get("result", [])
@@ -816,6 +921,27 @@ def process_bot_updates(token: str) -> None:
             elif text.split("@", 1)[0] == "/unpair" and chat_id == STATE.get("paired_chat_id"):
                 unpair()
                 send_telegram(token, chat_id, "🔓 已解除配对。需要重新配对才能接收验证码。")
+            elif chat.get("type") == "private" and chat_id == STATE.get("paired_chat_id") and text.strip():
+                quoted = message.get("reply_to_message") or {}
+                quoted_id = quoted.get("message_id")
+                if not isinstance(quoted_id, int):
+                    send_telegram(token, chat_id, "请引用一条 SMS Bridge 通知后，再输入要发送的短信内容。")
+                elif valid_sms_reply_text(text) is None:
+                    send_telegram(token, chat_id, f"短信回复必须是 1–{MAX_SMS_REPLY_LENGTH} 个字符的纯文本。")
+                else:
+                    recipient = STATE.take_reply_target(quoted_id)
+                    if not recipient:
+                        send_telegram(token, chat_id, "该通知不能再回复：它可能已过期、不是短信通知，或已经使用过。")
+                    else:
+                        # Consume the target before confirmation: Telegram can retry
+                        # an update after a network fault, but an SMS must never send twice.
+                        send_sms_reply(recipient, text)
+                        STATE.set("telegram_update_offset", next_offset)
+                        try:
+                            send_telegram(token, chat_id, "✅ 短信已交给 macOS「信息」发送。")
+                        except BridgeError:
+                            pass
+                        continue
             # Store only after the update was fully handled; transient send failures retry.
             STATE.set("telegram_update_offset", next_offset)
 
@@ -1136,13 +1262,15 @@ class TelegramProvider(NotificationProvider):
     provider_id = "telegram"
     display_name = "Telegram"
 
-    def send(self, notification: OutboundNotification) -> None:
-        send_telegram(
+    def send(self, notification: OutboundNotification) -> int | None:
+        response = send_telegram(
             self.token,
             self.chat_id,
             render_telegram_notification(notification),
             copy_text=notification.code,
         )
+        message_id = response.get("result", {}).get("message_id") if isinstance(response, dict) else None
+        return message_id if isinstance(message_id, int) else None
 
 
 @dataclass(frozen=True)
@@ -1247,7 +1375,11 @@ def bridge_loop() -> None:
                             delivery_key = provider_delivery_key(provider.provider_id)
                             if int(STATE.get(delivery_key) or "0") >= rowid:
                                 continue
-                            provider.send(notification)
+                            provider_result = provider.send(notification)
+                            if isinstance(provider, TelegramProvider) and isinstance(provider_result, int):
+                                recipient = replyable_sms_recipient(str(message["sender"]))
+                                if recipient:
+                                    STATE.save_reply_target(provider_result, recipient)
                             STATE.set(delivery_key, str(rowid))
                             STATE.set(
                                 f"last_forwarded_at_{provider.provider_id}",

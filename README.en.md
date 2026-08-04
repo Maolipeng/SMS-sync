@@ -74,6 +74,12 @@ python3 sms_bridge.py discord remove
 - Discord accepts only canonical `https://discord.com/api/webhooks/...` URLs, disables mentions, and refuses credential-bearing redirects.
 - Telegram commands: `/status` and `/unpair` are accepted only from the paired private chat.
 
+## Reply by SMS from Telegram
+
+Reply to a Telegram notification using Telegram's reply action and SMS Bridge asks the local Messages app to send an SMS to that notification's phone number. Each notification can be used once; its phone-number routing record expires after seven days and never contains message text. Expired notifications, test notifications, and iMessage email senders cannot be replied to.
+
+macOS may ask for permission to automate Messages on the first reply. Allow it only when the prompt identifies the SMS Bridge Python process you launched. Replies are accepted only in the paired Telegram private chat and are limited to 1,000 characters. Discord webhooks remain receive-only.
+
 Read [SECURITY.md](SECURITY.md) and the detailed [threat model](docs/THREAT_MODEL.en.md) before self-hosting or contributing. If a Bot Token or Discord Webhook URL has ever been posted in a chat, issue tracker, screenshot, or commit, revoke the Token in @BotFather or regenerate the Webhook immediately.
 
 ## Development
