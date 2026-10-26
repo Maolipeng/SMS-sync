@@ -57,6 +57,7 @@ macOS 可能仍不允许由未授权 Terminal 直接启动的设置页读取信�
 - 验证码不保存为历史记录；Bot Token 与 Discord Webhook URL 静态存储于 macOS 钥匙串，运行期间只在进程内存缓存；
 - Discord URL 仅接受官方 `https://discord.com/api/webhooks/...` 形式，发送时禁用 mentions，并拒绝携带凭据的重定向；
 - 多渠道投递分别记录脱敏游标；一个渠道临时失败时，不会重复发送已在另一渠道成功投递的同一条消息；
+- 默认只转发原始时间在最近 24 小时内的消息；历史补同步、超过时限的离线积压及无效时间记录会被跳过，不会因行号增加而重新发送。当天通知显示“今天 + 时分”，跨天显示完整日期；
 - 运行状态仅保存在 `~/Library/Application Support/SMS Bridge`，目录和数据库只允许当前用户访问；
 - 同时启动多个 CLI、设置页或常驻服务时会被单实例锁拒绝，避免重复转发；
 - 设置页的写操作只接受同源请求，防止恶意网页在后台替换 Token 或配对聊天；
@@ -91,6 +92,7 @@ python3 sms_bridge.py config --show-original off  # 恢复隐私默认值
 python3 sms_bridge.py config --mode strict        # 严格验证码（默认）
 python3 sms_bridge.py config --mode smart         # 智能识别短验证码短信
 python3 sms_bridge.py config --mode all           # 所有收到的文本（含原文）
+python3 sms_bridge.py config --max-age-hours 24   # 消息时效，1–168 小时，默认 24
 python3 sms_bridge.py discord set                  # 隐藏输入并保存 Discord Webhook
 python3 sms_bridge.py discord test
 python3 sms_bridge.py discord enable

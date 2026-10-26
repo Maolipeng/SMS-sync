@@ -7,6 +7,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest.mock import patch
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -420,6 +421,57 @@ class KeychainCacheTests(unittest.TestCase):
 
 
 class RelayReliabilityTests(unittest.TestCase):
+    def test_backfilled_history_is_skipped_without_blocking_fresh_messages(self):
+        now = time.time() - app.APPLE_MESSAGES_EPOCH.timestamp()
+        messages = [
+            {"rowid": 1, "date": int((now - 48 * 3600) * 1e9)},
+            {"rowid": 2, "date": None},
+            {"rowid": 3, "date": int(now * 1e9),
+             "text": "Google verification code: 123456", "sender": "synthetic"},
+        ]
+        provider = unittest.mock.Mock(provider_id="history_test")
+        stop = unittest.mock.Mock()
+        stop.wait.side_effect = [False, True]
+        stop.is_set.return_value = False
+        try:
+            app.STATE.set("last_rowid", "0")
+            app.STATE.delete("provider_cursor_history_test")
+            with patch.multiple(app, STOP=stop, keychain_token=lambda: None,
+                                fetch_messages=lambda _: messages,
+                                active_notification_providers=lambda: [provider]):
+                app.bridge_loop()
+            provider.send.assert_called_once()
+            self.assertEqual(app.STATE.get("last_rowid"), "3")
+            self.assertEqual(app.STATE.get("provider_cursor_history_test"), "3")
+        finally:
+            for key in ("last_rowid", "provider_cursor_history_test", "last_error"):
+                app.STATE.delete(key)
+
+    def test_freshness_boundaries_units_and_config(self):
+        now = app.APPLE_MESSAGES_EPOCH + app.timedelta(days=9000)
+        seconds = (now - app.APPLE_MESSAGES_EPOCH).total_seconds()
+        try:
+            for raw in (seconds - 86400, (seconds - 86400) * 1e9, seconds + 300):
+                self.assertTrue(app.message_is_recent(raw, now=now))
+            for raw in (seconds - 86401, seconds + 301, None, "bad", float("nan"), float("inf"), 0):
+                self.assertFalse(app.message_is_recent(raw, now=now))
+            app.STATE.set("max_message_age_hours", "48")
+            self.assertTrue(app.message_is_recent(seconds - 90000, now=now))
+            for invalid in ("0", "-1", "169", "bad"):
+                app.STATE.set("max_message_age_hours", invalid)
+                self.assertEqual(app.max_message_age_hours(), 24)
+        finally:
+            app.STATE.delete("max_message_age_hours")
+
+    def test_notification_date_distinguishes_today_and_history(self):
+        received = app.datetime(2026, 8, 27, 12, 0, tzinfo=app.timezone.utc)
+        raw = (received - app.APPLE_MESSAGES_EPOCH).total_seconds()
+        self.assertEqual(app.message_time_label(raw, now=received),
+                         received.astimezone().strftime("今天 %H:%M"))
+        self.assertEqual(app.message_time_label(raw, now=received + app.timedelta(days=1)),
+                         received.astimezone().strftime("%Y-%m-%d %H:%M"))
+        self.assertEqual(app.message_time_label(None), "时间未知")
+
     def test_initial_messages_permission_failure_recovers_without_exit(self):
         original_stop = app.STOP
         original_keychain = app.keychain_token
@@ -491,7 +543,7 @@ class RelayReliabilityTests(unittest.TestCase):
         message = {
             "rowid": 1,
             "text": "Google verification code: 123456",
-            "date": 0,
+            "date": int((time.time() - app.APPLE_MESSAGES_EPOCH.timestamp()) * 1_000_000_000),
             "sender": "+1 555 010 1234",
         }
         try:
@@ -536,7 +588,7 @@ class RelayReliabilityTests(unittest.TestCase):
         message = {
             "rowid": 7,
             "text": "Google verification code: 123456",
-            "date": 0,
+            "date": int((time.time() - app.APPLE_MESSAGES_EPOCH.timestamp()) * 1_000_000_000),
             "sender": "+1 555 010 1234",
         }
 
@@ -597,7 +649,7 @@ class RelayReliabilityTests(unittest.TestCase):
         message = {
             "rowid": 11,
             "text": "Google verification code: 123456",
-            "date": 0,
+            "date": int((time.time() - app.APPLE_MESSAGES_EPOCH.timestamp()) * 1_000_000_000),
             "sender": "+1 555 010 1234",
         }
         try:

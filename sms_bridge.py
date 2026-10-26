@@ -51,6 +51,7 @@ DISCORD_KEYCHAIN_SERVICE = "dev.smsbridge.discord-webhook-url.v1"
 LAUNCH_AGENT_LABEL = "dev.smsbridge.service"
 LEGACY_LAUNCH_AGENT_LABELS = ("com.local.sms-bridge",)
 POLL_SECONDS = 3
+DEFAULT_MAX_MESSAGE_AGE_HOURS = 24
 PAIRING_TTL_SECONDS = 10 * 60
 MAX_MESSAGE_LENGTH = 3500
 MAX_PREVIEW_LENGTH = 1800
@@ -1077,17 +1078,43 @@ def format_code(code: str) -> str:
     return code
 
 
-def message_time_label(raw_date: object | None) -> str:
-    """Convert Apple's 2001 epoch (usually nanoseconds) to local HH:MM."""
+def message_datetime(raw_date: object | None) -> datetime | None:
+    """Decode Apple timestamps without treating missing/invalid dates as new."""
     if raw_date is None:
-        return datetime.now().astimezone().strftime("%H:%M")
+        return None
     try:
         seconds = float(raw_date)
         if abs(seconds) > 10_000_000_000:
             seconds /= 1_000_000_000
-        return (APPLE_MESSAGES_EPOCH + timedelta(seconds=seconds)).astimezone().strftime("%H:%M")
+        return APPLE_MESSAGES_EPOCH + timedelta(seconds=seconds)
     except (TypeError, ValueError, OverflowError):
-        return datetime.now().astimezone().strftime("%H:%M")
+        return None
+
+
+def message_time_label(raw_date: object | None, *, now: datetime | None = None) -> str:
+    received = message_datetime(raw_date)
+    if received is None:
+        return "时间未知"
+    local = received.astimezone()
+    today = (now or datetime.now(timezone.utc)).astimezone().date()
+    return local.strftime("今天 %H:%M" if local.date() == today else "%Y-%m-%d %H:%M")
+
+
+def max_message_age_hours() -> int:
+    try:
+        value = int(STATE.get("max_message_age_hours") or DEFAULT_MAX_MESSAGE_AGE_HOURS)
+        return value if 1 <= value <= 168 else DEFAULT_MAX_MESSAGE_AGE_HOURS
+    except ValueError:
+        return DEFAULT_MAX_MESSAGE_AGE_HOURS
+
+
+def message_is_recent(raw_date: object | None, *, now: datetime | None = None) -> bool:
+    received = message_datetime(raw_date)
+    if received is None:
+        return False
+    age = ((now or datetime.now(timezone.utc)) - received).total_seconds()
+    # Allow minor clock skew, but never forward a malformed far-future date.
+    return -300 <= age <= max_message_age_hours() * 3600
 
 
 def preview_enabled() -> bool:
@@ -1352,6 +1379,11 @@ def bridge_loop() -> None:
             mode = forward_mode()
             for message in messages:
                 rowid = int(message["rowid"])
+                # iCloud history backfills receive new ROWIDs too. Check the
+                # original date on every retry before extracting or sending text.
+                if not message_is_recent(message["date"]):
+                    STATE.set("last_rowid", str(rowid))
+                    continue
                 text = message_text(message)
                 if not text:
                     STATE.set("last_rowid", str(rowid))
@@ -1443,6 +1475,7 @@ def status() -> dict:
         "pairingRemaining": max(0, pair_expires - int(time.time())),
         "showOriginal": preview_enabled(),
         "forwardMode": forward_mode(),
+        "maxMessageAgeHours": max_message_age_hours(),
         "discordConfigured": discord_configured,
         "discordEnabled": discord_active,
         "hasActiveProvider": bool((configured and paired) or discord_active),
@@ -1629,6 +1662,8 @@ def main() -> None:
     config = commands.add_parser("config", help="查看或修改通知显示选项")
     config.add_argument("--show-original", choices=("on", "off"), help="是否在所有已启用渠道中附带完整原文")
     config.add_argument("--mode", choices=FORWARD_MODES, help="转发规则：strict、smart 或 all")
+    config.add_argument("--max-age-hours", type=int, choices=range(1, 169), metavar="1-168",
+                        help="仅转发最近多少小时的消息（默认 24，最多 168）")
     discord_command = commands.add_parser("discord", help="配置 Discord Webhook 通知")
     discord_actions = discord_command.add_subparsers(dest="discord_action", metavar="操作")
     discord_actions.add_parser("set", help="隐藏输入并保存 Webhook URL")
@@ -1685,9 +1720,12 @@ def main() -> None:
             set_preview_enabled(args.show_original == "on")
         if args.mode:
             set_forward_mode(args.mode)
+        if args.max_age_hours is not None:
+            STATE.set("max_message_age_hours", str(args.max_age_hours))
         print(json.dumps({
             "showOriginal": preview_enabled(),
             "forwardMode": forward_mode(),
+            "maxMessageAgeHours": max_message_age_hours(),
         }, ensure_ascii=False, indent=2))
     elif command == "discord":
         action = args.discord_action or "status"
